@@ -269,10 +269,6 @@ namespace libtorrent {
 #endif
 	}
 
-#ifdef TORRENT_WINDOWS
-	void acquire_manage_volume_privs();
-#endif
-
 	file::file() : m_file_handle(INVALID_HANDLE_VALUE)
 	{}
 
@@ -336,14 +332,6 @@ namespace libtorrent {
 		DWORD const flags = ((mode & aux::open_mode::random_access) ? 0 : FILE_FLAG_SEQUENTIAL_SCAN)
 			| a
 			| ((mode & aux::open_mode::no_cache) ? FILE_FLAG_WRITE_THROUGH : 0);
-
-		if (!(mode & aux::open_mode::sparse))
-		{
-			// Enable privilege required by SetFileValidData()
-			// https://docs.microsoft.com/en-us/windows/desktop/api/fileapi/nf-fileapi-setfilevaliddata
-			static std::once_flag flag;
-			std::call_once(flag, acquire_manage_volume_privs);
-		}
 
 		handle_type handle = CreateFileW(file_path.c_str(), m.rw_mode
 			, FILE_SHARE_READ | FILE_SHARE_WRITE
@@ -647,68 +635,6 @@ typedef struct _FILE_ALLOCATED_RANGE_BUFFER {
 		return ret;
 	}
 
-#ifdef TORRENT_WINDOWS
-	void acquire_manage_volume_privs()
-	{
-		using OpenProcessToken_t = BOOL (WINAPI*)(HANDLE, DWORD, PHANDLE);
-
-		using LookupPrivilegeValue_t = BOOL (WINAPI*)(LPCSTR, LPCSTR, PLUID);
-
-		using AdjustTokenPrivileges_t = BOOL (WINAPI*)(
-			HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD, PTOKEN_PRIVILEGES, PDWORD);
-
-		auto OpenProcessToken =
-			aux::get_library_procedure<aux::advapi32, OpenProcessToken_t>("OpenProcessToken");
-		auto LookupPrivilegeValue =
-			aux::get_library_procedure<aux::advapi32, LookupPrivilegeValue_t>("LookupPrivilegeValueA");
-		auto AdjustTokenPrivileges =
-			aux::get_library_procedure<aux::advapi32, AdjustTokenPrivileges_t>("AdjustTokenPrivileges");
-
-		if (OpenProcessToken == nullptr
-			|| LookupPrivilegeValue == nullptr
-			|| AdjustTokenPrivileges == nullptr)
-		{
-			return;
-		}
-
-
-		HANDLE token;
-		if (!OpenProcessToken(GetCurrentProcess()
-			, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
-			return;
-
-		BOOST_SCOPE_EXIT_ALL(&token) {
-			CloseHandle(token);
-		};
-
-		TOKEN_PRIVILEGES privs{};
-		if (!LookupPrivilegeValue(nullptr, "SeManageVolumePrivilege"
-			, &privs.Privileges[0].Luid))
-		{
-			return;
-		}
-
-		privs.PrivilegeCount = 1;
-		privs.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-		AdjustTokenPrivileges(token, FALSE, &privs, 0, nullptr, nullptr);
-	}
-
-	void set_file_valid_data(HANDLE f, std::int64_t size)
-	{
-		using SetFileValidData_t = BOOL (WINAPI*)(HANDLE, LONGLONG);
-		auto SetFileValidData =
-			aux::get_library_procedure<aux::kernel32, SetFileValidData_t>("SetFileValidData");
-
-		if (SetFileValidData)
-		{
-			// we don't necessarily expect to have enough
-			// privilege to do this, so ignore errors.
-			SetFileValidData(f, size);
-		}
-	}
-#endif
-
 	bool file::set_size(std::int64_t s, error_code& ec)
 	{
 		TORRENT_ASSERT(is_open());
@@ -738,13 +664,6 @@ typedef struct _FILE_ALLOCATED_RANGE_BUFFER {
 			{
 				ec.assign(GetLastError(), system_category());
 				return false;
-			}
-			if (!(m_open_mode & aux::open_mode::sparse))
-			{
-				// if the user has permissions, avoid filling
-				// the file with zeroes, but just fill it with
-				// garbage instead
-				set_file_valid_data(m_file_handle, s);
 			}
 		}
 #else // NON-WINDOWS
